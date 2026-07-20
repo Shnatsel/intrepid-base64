@@ -1,10 +1,16 @@
 //! A SIMD-accelerated implementation of standard padded Base64.
+//!
+//! Enable the `avx512` Cargo feature to compile the runtime-detected dedicated
+//! AVX-512/VBMI implementation.
 
 #![forbid(unsafe_code)]
 
 use std::sync::OnceLock;
 
 use fearless_simd::{Level, Simd, dispatch, mask8x64, prelude::*, u8x16, u8x32, u8x64, u32x16};
+
+#[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+mod avx512;
 
 const ALPHABET: [u8; 64] = *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -98,6 +104,12 @@ pub fn encode(input: &[u8]) -> String {
     let mut output = vec![0; output_len];
     let level = *SIMD_LEVEL.get_or_init(Level::new);
 
+    #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+    if let Some(avx512) = level.as_avx512() {
+        avx512::encode(avx512, input, &mut output);
+        return String::from_utf8(output).expect("the Base64 alphabet is valid UTF-8");
+    }
+
     dispatch!(level, simd => encode_impl(simd, input, &mut output));
 
     String::from_utf8(output).expect("the Base64 alphabet is valid UTF-8")
@@ -115,6 +127,14 @@ pub fn decode(input: &[u8]) -> Result<Vec<u8>, DecodeError> {
         .ok_or(DecodeError::LengthOverflow)?;
     let mut output = vec![0; maximum_len];
     let level = *SIMD_LEVEL.get_or_init(Level::new);
+
+    #[cfg(all(feature = "avx512", any(target_arch = "x86", target_arch = "x86_64")))]
+    if let Some(avx512) = level.as_avx512() {
+        avx512::decode(avx512, input, &mut output, padding)?;
+        validate_trailing_bits(input, padding)?;
+        output.truncate(maximum_len - padding);
+        return Ok(output);
+    }
 
     dispatch!(level, simd => decode_impl(simd, input, &mut output, padding))?;
 
@@ -428,7 +448,7 @@ mod tests {
         let valid = encode(&[0x5a; 96]);
         assert_eq!(valid.len(), 128);
 
-        for index in 0..64 {
+        for index in 0..128 {
             let mut corrupted = valid.clone().into_bytes();
             corrupted[index] = 0xff;
             assert_eq!(
